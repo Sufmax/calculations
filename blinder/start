@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# Lancer ton script en arrière-plan
+cd ${HOME}/program
+python main.py &
+
+# Lancer Jupyter (requis par MyBinder pour rester actif)
+exec "$@"
