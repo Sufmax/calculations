@@ -1,0 +1,11 @@
+#!/bin/bash
+
+cd ~/program
+
+# Installer les requirements
+if [ -f requirements.txt ]; then
+    pip install --user -r requirements.txt
+fi
+
+# Lancer ton script (modifie le nom si besoin)
+python main.py
