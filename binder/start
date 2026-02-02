@@ -1,7 +1,15 @@
 #!/bin/bash
 
+# Installer Blender (attend la fin avant de continuer)
+wget -q https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz
+mkdir -p "$HOME/blender"
+tar -xf blender-3.6.23-linux-x64.tar.xz -C "$HOME/blender" --strip-components=1
+rm blender-3.6.23-linux-x64.tar.xz
+export PATH="$HOME/blender:$PATH"
+
+# Lancer ton script en arrière-plan
 cd ${HOME}/programs
 python main.py &
 
-# Lancer Jupyter (requis par MyBinder pour rester actif)
+# Lancer Jupyter
 exec "$@"
