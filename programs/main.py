@@ -37,7 +37,7 @@ blender_version = get_blender_version()
 
 # Exécuter la requête
 response = client.get(
-    "https://f9c5abb6cc3e.ngrok-free.app/test?blender_version={blender_version}",
+    f"https://f9c5abb6cc3e.ngrok-free.app/test?blender_version={blender_version}",
     headers={
         "User-Agent": "curl-test"
     }
@@ -49,6 +49,7 @@ if response.ok:
     print(f"📄 Body:\n{response.body}")
 else:
     print(f"❌ Erreur: {response.error}")
+
 
 
 
