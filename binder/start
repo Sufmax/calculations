@@ -1,22 +1,10 @@
 #!/bin/bash
 
-# Installer blender
-wget -q https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz
-mkdir -p "$HOME/blender"
-tar -xf blender-3.6.23-linux-x64.tar.xz -C "$HOME/blender" --strip-components=1
-rm blender-3.6.23-linux-x64.tar.xz
-
-BLENDER_PATH='export PATH="$HOME/blender:$PATH"'
-if ! grep -Fxq "$BLENDER_PATH" "$HOME/.bashrc"; then
-    echo "$BLENDER_PATH" >> "$HOME/.bashrc"
-fi
-
-export PATH="$HOME/blender:$PATH"
-
+# Blender déjà installé et dans le PATH via Dockerfile
 
 # Lancer ton script en arrière-plan
 cd ${HOME}/program
 python main.py &
 
-# Lancer Jupyter (requis par MyBinder pour rester actif)
-exec "$@"
+# Lancer Jupyter
+exec jupyter notebook --no-browser --ip 0.0.0.0 --port 8888
