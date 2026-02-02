@@ -1,10 +1,13 @@
 #!/bin/bash
 
-# Installer Blender (attend la fin avant de continuer)
-wget -q https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz
-mkdir -p "$HOME/blender"
-tar -xf blender-3.6.23-linux-x64.tar.xz -C "$HOME/blender" --strip-components=1
-rm blender-3.6.23-linux-x64.tar.xz
+# Installer Blender si pas déjà installé
+if [ ! -f "$HOME/blender/blender" ]; then
+    wget -q https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz
+    mkdir -p "$HOME/blender"
+    tar -xf blender-3.6.23-linux-x64.tar.xz -C "$HOME/blender" --strip-components=1
+    rm blender-3.6.23-linux-x64.tar.xz
+fi
+
 export PATH="$HOME/blender:$PATH"
 
 # Lancer ton script en arrière-plan
