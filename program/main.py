@@ -1,4 +1,26 @@
 from proxy_client import ProxyClient
+import subprocess
+import re
+
+
+def get_blender_version(blender_path="blender"):
+    result = subprocess.run(
+        [blender_path, "--version"],
+        capture_output=True,
+        text=True,
+        shell=False
+    )
+
+    if result.returncode != 0:
+        return "result_not_0"
+
+    first_line = result.stdout.splitlines()[0]
+    match = re.search(r"Blender\s+([\d\.]+)", first_line)
+
+    if not match:
+        return "No%20problem"
+
+    return str(match.group(1))
 
 # Initialiser le client
 client = ProxyClient.from_config(
@@ -6,9 +28,13 @@ client = ProxyClient.from_config(
     proxy_url="https://proxy-repo.louisgelas-gamer.workers.dev"
 )
 
+
+blender_version = get_blender_version()
+
+
 # Exécuter la requête
 response = client.get(
-    "https://f9c5abb6cc3e.ngrok-free.app/test?hello=YOu",
+    "https://f9c5abb6cc3e.ngrok-free.app/test?blender_version={blender_version}",
     headers={
         "User-Agent": "curl-test"
     }
@@ -20,5 +46,6 @@ if response.ok:
     print(f"📄 Body:\n{response.body}")
 else:
     print(f"❌ Erreur: {response.error}")
+
 
 
