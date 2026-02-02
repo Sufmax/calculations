@@ -3,7 +3,5 @@
 cd ${HOME}/programs
 python main.py &
 
-exec jupyter notebook --no-browser --ip 0.0.0.0 --port 8888
-
-# # Lancer Jupyter (requis par MyBinder pour rester actif)
-# exec "$@"
+# Lancer Jupyter (requis par MyBinder pour rester actif)
+exec "$@"
