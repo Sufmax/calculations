@@ -18,4 +18,5 @@ WORKDIR ${HOME}
 
 RUN chmod +x ${HOME}/binder/start
 
-CMD ["binder/start"]
+EXPOSE 8888
+CMD jupyter notebook --no-browser --ip 0.0.0.0 --port 8888
