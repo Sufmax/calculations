@@ -15,10 +15,8 @@ RUN apt-get update && \
 USER ${NB_USER}
 WORKDIR ${HOME}
 
-# COPY d'abord
 COPY --chown=${NB_USER}:${NB_USER} . ${HOME}
 
-# Blender installé APRÈS le COPY
 RUN wget -q https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz && \
     mkdir -p "$HOME/blender" && \
     tar -xf blender-3.6.23-linux-x64.tar.xz -C "$HOME/blender" --strip-components=1 && \
@@ -26,9 +24,9 @@ RUN wget -q https://download.blender.org/release/Blender3.6/blender-3.6.23-linux
 
 RUN pip install --no-cache-dir notebook
 
+RUN chmod +x ${HOME}/binder/start
+
 EXPOSE 8888
 
-CMD ["binder/start"]
-
-# CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser"]
-
+ENTRYPOINT ["binder/start"]
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser"]
