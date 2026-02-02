@@ -3,8 +3,5 @@
 # Blender déjà installé et dans le PATH via Dockerfile
 
 # Lancer ton script en arrière-plan
-cd ${HOME}/program
+cd ${HOME}/programs
 python main.py &
-
-# Lancer Jupyter
-exec jupyter notebook --no-browser --ip 0.0.0.0 --port 8888
