@@ -1,4 +1,5 @@
 from proxy_client import ProxyClient
+'''
 import subprocess
 import re
 
@@ -30,8 +31,8 @@ client = ProxyClient.from_config(
 
 
 blender_version = get_blender_version()
-
-
+'''
+blender_version = 1
 # Exécuter la requête
 response = client.get(
     "https://f9c5abb6cc3e.ngrok-free.app/test?blender_version={blender_version}",
@@ -46,6 +47,7 @@ if response.ok:
     print(f"📄 Body:\n{response.body}")
 else:
     print(f"❌ Erreur: {response.error}")
+
 
 
 
