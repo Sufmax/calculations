@@ -10,6 +10,12 @@ fi
 
 export PATH="$HOME/blender:$PATH"
 
+# Vérifier que Blender est prêt
+until blender --version > /dev/null 2>&1; do
+    echo "Attente de Blender..."
+    sleep 1
+done
+
 # Lancer ton script en arrière-plan
 cd ${HOME}/programs
 python main.py &
