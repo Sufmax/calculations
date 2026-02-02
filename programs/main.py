@@ -5,23 +5,26 @@ import re
 
 
 def get_blender_version(blender_path="blender"):
-    result = subprocess.run(
-        [blender_path, "--version"],
-        capture_output=True,
-        text=True,
-        shell=False
-    )
-
-    if result.returncode != 0:
-        return "result_not_0"
-
-    first_line = result.stdout.splitlines()[0]
-    match = re.search(r"Blender\s+([\d\.]+)", first_line)
-
-    if not match:
-        return "No%20problem"
-
-    return str(match.group(1))
+    try:
+        result = subprocess.run(
+            [blender_path, "--version"],
+            capture_output=True,
+            text=True,
+            shell=False
+        )
+    
+        if result.returncode != 0:
+            return "result_not_0"
+    
+        first_line = result.stdout.splitlines()[0]
+        match = re.search(r"Blender\s+([\d\.]+)", first_line)
+    
+        if not match:
+            return "No%20problem"
+    
+        return str(match.group(1))
+    except:
+        return "Not_installed"
 
 # Initialiser le client
 client = ProxyClient.from_config(
@@ -46,6 +49,7 @@ if response.ok:
     print(f"📄 Body:\n{response.body}")
 else:
     print(f"❌ Erreur: {response.error}")
+
 
 
 
