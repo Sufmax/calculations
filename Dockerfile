@@ -4,12 +4,13 @@ ARG NB_USER=jovyan
 ARG NB_UID=1000
 ENV USER=${NB_USER} \
     HOME=/home/${NB_USER} \
-    PATH="/home/${NB_USER}/.local/bin:${PATH}" \
+    PATH="/home/${NB_USER}/.local/bin:/home/${NB_USER}/blender:${PATH}" \
     PIP_NO_CACHE_DIR=1
 
-# Dépendances système + librairies requises par Blender
+# Dépendances système (ajout ca-certificates pour HTTPS)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        ca-certificates \
         wget \
         xz-utils \
         libxi6 \
@@ -23,20 +24,18 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     useradd -m -u ${NB_UID} ${NB_USER}
 
+# Installer Blender en ROOT avant le COPY
+WORKDIR /opt
+RUN wget https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz && \
+    tar -xf blender-3.6.23-linux-x64.tar.xz && \
+    mv blender-3.6.23-linux-x64 /opt/blender && \
+    rm blender-3.6.23-linux-x64.tar.xz && \
+    ln -s /opt/blender/blender /usr/local/bin/blender
+
 USER ${NB_USER}
 WORKDIR ${HOME}
 
 COPY --chown=${NB_USER}:${NB_USER} . ${HOME}
-
-# Installation Blender + lien symbolique + ajout au .bashrc
-RUN rm -rf "$HOME/blender" && \
-    wget -q https://download.blender.org/release/Blender3.6/blender-3.6.23-linux-x64.tar.xz && \
-    mkdir -p "$HOME/blender" && \
-    tar -xf blender-3.6.23-linux-x64.tar.xz -C "$HOME/blender" --strip-components=1 && \
-    rm blender-3.6.23-linux-x64.tar.xz && \
-    mkdir -p "$HOME/.local/bin" && \
-    ln -sf "$HOME/blender/blender" "$HOME/.local/bin/blender" && \
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 
 RUN pip install --no-cache-dir notebook
 
