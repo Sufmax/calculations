@@ -25,6 +25,9 @@ COPY --chown=${NB_USER}:${NB_USER} . ${HOME}
 
 RUN pip install --no-cache-dir notebook
 
+CMD binder/start
+
 EXPOSE 8888
 
-CMD binder/start
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser"]
+
