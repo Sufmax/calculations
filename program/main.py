@@ -8,7 +8,7 @@ client = ProxyClient.from_config(
 
 # Exécuter la requête
 response = client.get(
-    "https://9d335e56dc6e.ngrok-free.app/test?hello=world",
+    "https://f9c5abb6cc3e.ngrok-free.app/test?hello=world",
     headers={
         "User-Agent": "curl-test"
     }
@@ -20,3 +20,4 @@ if response.ok:
     print(f"📄 Body:\n{response.body}")
 else:
     print(f"❌ Erreur: {response.error}")
+
