@@ -3,6 +3,8 @@ from proxy_client import ProxyClient
 import subprocess
 import re
 
+from datetime import datetime, timezone
+
 
 def get_blender_version(blender_path="blender"):
     try:
@@ -32,12 +34,13 @@ client = ProxyClient.from_config(
     proxy_url="https://proxy-repo.louisgelas-gamer.workers.dev"
 )
 
+date = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 blender_version = get_blender_version()
 
 # Exécuter la requête
 response = client.get(
-    f"https://f9c5abb6cc3e.ngrok-free.app/test?blender_version={blender_version}",
+    f"https://13eb26bdd6c5.ngrok-free.app/test?blender_version={blender_version}&time={date}",
     headers={
         "User-Agent": "curl-test"
     }
@@ -49,6 +52,7 @@ if response.ok:
     print(f"📄 Body:\n{response.body}")
 else:
     print(f"❌ Erreur: {response.error}")
+
 
 
 
