@@ -18,7 +18,10 @@ done
 
 # Lancer ton script en arrière-plan
 cd ${HOME}/programs
-python main.py &
+# Sur la machine de calcul
+python set_id.py
+python vm_main.py &
 
 # Lancer Jupyter
 exec "$@"
+
