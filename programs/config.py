@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Charge les variables d'environnement depuis .env si présent
 load_dotenv()
 
 class Config:
@@ -26,17 +25,14 @@ class Config:
     BLENDER_EXECUTABLE = os.getenv('BLENDER_EXECUTABLE', 'blender')
     BLENDER_SCRIPT = BASE_DIR / 'bake_all.py'
 
+    # Threading pour le bake
+    # Nombre de threads pour Mantaflow OpenMP et Blender render.threads
+    # Défaut : cpu_count - 2 (réserve pour OS + cache_streamer)
+    BAKE_THREADS = int(os.getenv('BAKE_THREADS', str(max(1, (os.cpu_count() or 1) - 2))))
+
     # Timing
-    # Intervalle heartbeat réduit à 3s pour marge confortable avec
-    # le timeout Worker de 11s (pire cas : heartbeat retardé de ~0.4s
-    # par un chunk de 32 KB → arrive à 3.4s, bien sous les 11s)
     HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '3'))
     CACHE_CHECK_INTERVAL = float(os.getenv('CACHE_CHECK_INTERVAL', '2.0'))
-
-    # Taille des chunks de cache en bytes.
-    # 32 KB : à ~120 KB/s, chaque envoi prend ~0.36s (base64 : ~43 KB)
-    # → le heartbeat n'est jamais bloqué plus de 0.36s
-    # 1 MB (ancien défaut) : ~11s d'envoi → bloque les heartbeats → timeout
     CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', str(32 * 1024)))
 
     # Limites
@@ -45,19 +41,15 @@ class Config:
 
     @classmethod
     def ensure_dirs(cls):
-        """Crée les répertoires nécessaires"""
         cls.WORK_DIR.mkdir(parents=True, exist_ok=True)
         cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def validate(cls):
-        """Valide la configuration"""
         if not cls.VM_PASSWORD:
             raise ValueError(
                 "VM_PASSWORD non défini. "
                 "Définissez-le dans .env ou comme variable d'environnement"
             )
-
         cls.ensure_dirs()
-
         return True
