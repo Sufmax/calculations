@@ -3,7 +3,6 @@ Client WebSocket pour la communication avec le serveur
 """
 
 import asyncio
-import base64
 import json
 import logging
 import time
@@ -57,7 +56,6 @@ class WSClient:
                     logger.info("Connecté au serveur")
 
                     await self.authenticate()
-
                     await self.receive_loop()
 
             except websockets.exceptions.ConnectionClosed as e:
@@ -116,7 +114,6 @@ class WSClient:
             try:
                 message_str = await self.ws.recv()
                 message = json.loads(message_str)
-
                 await self.handle_message(message)
 
             except websockets.exceptions.ConnectionClosed:
@@ -135,24 +132,20 @@ class WSClient:
 
         if msg_type == 'BLEND_FILE_URL':
             logger.info("URL .blend reçue")
-
         elif msg_type == 'BLEND_FILE':
             logger.info("Fichier .blend reçu (base64)")
-
+        elif msg_type == 'S3_CREDENTIALS':
+            logger.info("Credentials S3 reçues")
         elif msg_type == 'CACHE_DATA':
             logger.info("Données de cache reçues")
-
         elif msg_type == 'CACHE_DATA_URL':
             logger.info("URL cache reçue")
-
         elif msg_type == 'TERMINATE':
             reason = message.get('reason', 'Non spécifié')
             logger.warning(f"Demande de terminaison: {reason}")
             self.is_running = False
-
         elif msg_type == 'PONG':
             pass
-
         else:
             logger.debug(f"Message reçu: {msg_type}")
 
@@ -160,7 +153,7 @@ class WSClient:
             await self.on_message(message)
 
     async def send(self, message: dict):
-        """Envoie un message au serveur avec logging de la taille"""
+        """Envoie un message au serveur"""
         if not self.ws:
             logger.warning("Impossible d'envoyer, pas de connexion")
             return False
@@ -168,20 +161,11 @@ class WSClient:
         try:
             serialized = json.dumps(message)
             msg_size = len(serialized.encode('utf-8'))
-            msg_type = message.get('type', '?')
 
             await self.ws.send(serialized)
 
             self._total_bytes_sent += msg_size
             self._total_messages_sent += 1
-
-            # Log concis pour les messages non-chunk (ALIVE est silencieux)
-            if msg_type not in ('ALIVE', 'CACHE_CHUNK'):
-                logger.debug(
-                    f"Envoyé {msg_type} ({msg_size} bytes, "
-                    f"total: {self._total_messages_sent} msgs)"
-                )
-
             return True
         except Exception as e:
             logger.error(f"Erreur envoi message: {e}")
@@ -191,44 +175,27 @@ class WSClient:
         """Envoie un heartbeat"""
         return await self.send({'type': 'ALIVE'})
 
-    async def send_cache_chunk(
+    async def send_progress(
         self,
-        chunk_id: str,
-        data: bytes,
-        final: bool = False
+        upload_percent: int,
+        disk_bytes: int,
+        disk_files: int,
+        uploaded_bytes: int,
+        uploaded_files: int,
+        errors: int,
+        rate_bytes_per_sec: float,
     ):
-        """Envoie un chunk de cache avec logging détaillé"""
-        # Encodage base64
-        b64_data = base64.b64encode(data).decode('utf-8')
-        b64_size = len(b64_data)
-        bin_size = len(data)
-
-        message = {
-            'type': 'CACHE_CHUNK',
-            'chunkId': chunk_id,
-            'data': b64_data,
-            'final': final
-        }
-
-        # Log détaillé pour chaque chunk
-        # Inclut les premiers octets en hex pour vérifier l'intégrité
-        first_bytes_hex = data[:16].hex() if len(data) >= 16 else data.hex()
-        logger.info(
-            f"→ CHUNK {chunk_id} | "
-            f"bin={bin_size}B b64={b64_size}B "
-            f"final={final} "
-            f"hex16={first_bytes_hex}"
-        )
-
-        result = await self.send(message)
-
-        if not result:
-            logger.error(
-                f"✗ CHUNK ÉCHEC {chunk_id} | "
-                f"bin={bin_size}B final={final}"
-            )
-
-        return result
+        """Envoie une mise à jour de progression (léger, pas de données binaires)."""
+        return await self.send({
+            'type': 'PROGRESS_UPDATE',
+            'uploadPercent': upload_percent,
+            'diskBytes': disk_bytes,
+            'diskFiles': disk_files,
+            'uploadedBytes': uploaded_bytes,
+            'uploadedFiles': uploaded_files,
+            'errors': errors,
+            'rateBytesPerSec': int(rate_bytes_per_sec),
+        })
 
     async def send_cache_complete(self):
         """Signale que le cache est complet"""
@@ -263,7 +230,6 @@ class WSClient:
             f"{self._total_bytes_sent} bytes)"
         )
         self.is_running = False
-
         if self.ws:
             asyncio.create_task(self.ws.close())
 
