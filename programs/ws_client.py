@@ -3,6 +3,7 @@ Client WebSocket pour la communication avec le serveur
 """
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -32,6 +33,10 @@ class WSClient:
         self.on_message: Optional[Callable[[dict], None]] = None
         self.on_disconnected: Optional[Callable] = None
         self.on_error: Optional[Callable[[Exception], None]] = None
+
+        # Stats d'envoi
+        self._total_bytes_sent = 0
+        self._total_messages_sent = 0
 
     async def connect(self):
         """Connecte au serveur WebSocket"""
@@ -155,13 +160,28 @@ class WSClient:
             await self.on_message(message)
 
     async def send(self, message: dict):
-        """Envoie un message au serveur"""
+        """Envoie un message au serveur avec logging de la taille"""
         if not self.ws:
             logger.warning("Impossible d'envoyer, pas de connexion")
             return False
 
         try:
-            await self.ws.send(json.dumps(message))
+            serialized = json.dumps(message)
+            msg_size = len(serialized.encode('utf-8'))
+            msg_type = message.get('type', '?')
+
+            await self.ws.send(serialized)
+
+            self._total_bytes_sent += msg_size
+            self._total_messages_sent += 1
+
+            # Log concis pour les messages non-chunk (ALIVE est silencieux)
+            if msg_type not in ('ALIVE', 'CACHE_CHUNK'):
+                logger.debug(
+                    f"Envoyé {msg_type} ({msg_size} bytes, "
+                    f"total: {self._total_messages_sent} msgs)"
+                )
+
             return True
         except Exception as e:
             logger.error(f"Erreur envoi message: {e}")
@@ -177,17 +197,38 @@ class WSClient:
         data: bytes,
         final: bool = False
     ):
-        """Envoie un chunk de cache"""
-        import base64
+        """Envoie un chunk de cache avec logging détaillé"""
+        # Encodage base64
+        b64_data = base64.b64encode(data).decode('utf-8')
+        b64_size = len(b64_data)
+        bin_size = len(data)
 
         message = {
             'type': 'CACHE_CHUNK',
             'chunkId': chunk_id,
-            'data': base64.b64encode(data).decode('utf-8'),
+            'data': b64_data,
             'final': final
         }
 
-        return await self.send(message)
+        # Log détaillé pour chaque chunk
+        # Inclut les premiers octets en hex pour vérifier l'intégrité
+        first_bytes_hex = data[:16].hex() if len(data) >= 16 else data.hex()
+        logger.info(
+            f"→ CHUNK {chunk_id} | "
+            f"bin={bin_size}B b64={b64_size}B "
+            f"final={final} "
+            f"hex16={first_bytes_hex}"
+        )
+
+        result = await self.send(message)
+
+        if not result:
+            logger.error(
+                f"✗ CHUNK ÉCHEC {chunk_id} | "
+                f"bin={bin_size}B final={final}"
+            )
+
+        return result
 
     async def send_cache_complete(self):
         """Signale que le cache est complet"""
@@ -216,7 +257,11 @@ class WSClient:
 
     def disconnect(self):
         """Déconnecte du serveur"""
-        logger.info("Déconnexion...")
+        logger.info(
+            f"Déconnexion... "
+            f"(total envoyé: {self._total_messages_sent} msgs, "
+            f"{self._total_bytes_sent} bytes)"
+        )
         self.is_running = False
 
         if self.ws:
