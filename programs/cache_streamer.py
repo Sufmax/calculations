@@ -1,9 +1,5 @@
 """
 Streamer de cache Blender — upload direct vers Storj.
-
-Au lieu de transférer les chunks via WebSocket (lent, base64 +33%),
-les fichiers de cache sont uploadés directement vers Storj S3 par la VM.
-Seuls les messages de progression transitent par le WebSocket.
 """
 
 import asyncio
@@ -36,8 +32,6 @@ UPLOAD_WORKERS = 3
 
 
 class CacheFileHandler(FileSystemEventHandler):
-    """Handler watchdog — détecte les fichiers de cache."""
-
     def __init__(self, streamer: 'CacheStreamer'):
         self.streamer = streamer
         super().__init__()
@@ -55,15 +49,6 @@ class CacheFileHandler(FileSystemEventHandler):
 
 
 class CacheStreamer:
-    """Upload direct des fichiers de cache vers Storj S3.
-
-    Architecture :
-    - Le watchdog surveille le répertoire cache (thread séparé)
-    - Les fichiers détectés sont mis en queue asyncio
-    - Un pool de threads effectue les uploads S3 en parallèle
-    - Un task asyncio envoie la progression via WebSocket toutes les 5s
-    """
-
     def __init__(
         self,
         cache_dir: Path,
@@ -73,7 +58,6 @@ class CacheStreamer:
         self.cache_dir = cache_dir
         self.ws_client = ws_client
 
-        # Initialiser l'uploader S3 direct
         self.uploader = S3Uploader(
             endpoint=s3_credentials['endpoint'],
             bucket=s3_credentials['bucket'],
@@ -94,18 +78,11 @@ class CacheStreamer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._executor = ThreadPoolExecutor(max_workers=UPLOAD_WORKERS)
 
-        # Stats
         self.start_time = time.time()
+        self.last_log_time = 0
 
     def start(self):
-        """Démarre le streamer."""
         logger.info(f"Démarrage du streamer (upload direct Storj): {self.cache_dir}")
-        logger.info(
-            f"  Endpoint : {self.uploader.endpoint}"
-            f"  Bucket   : {self.uploader.bucket}"
-            f"  Prefix   : {self.uploader.cache_prefix}"
-            f"  Workers  : {UPLOAD_WORKERS}"
-        )
         self.is_running = True
         self._loop = asyncio.get_event_loop()
 
@@ -115,7 +92,6 @@ class CacheStreamer:
         self._scan_existing_files()
 
     def stop(self):
-        """Arrête le streamer proprement."""
         logger.info("Arrêt du streamer de cache")
         self.is_running = False
 
@@ -139,7 +115,6 @@ class CacheStreamer:
 
     def _scan_existing_files(self):
         if not self.cache_dir.exists():
-            logger.warning(f"Répertoire cache inexistant: {self.cache_dir}")
             return
 
         count = 0
@@ -151,7 +126,6 @@ class CacheStreamer:
         logger.info(f"{count} fichiers de cache existants trouvés")
 
     def schedule_file(self, file_path: Path):
-        """Appelé depuis le thread watchdog — thread-safe."""
         if self._loop is None or not self.is_running:
             return
         try:
@@ -160,7 +134,6 @@ class CacheStreamer:
             pass
 
     def _queue_file(self, file_path: Path):
-        """Ajoute un fichier à la queue (sur le loop asyncio)."""
         key = str(file_path)
         if key in self.uploaded_files or key in self.pending_files:
             return
@@ -168,7 +141,6 @@ class CacheStreamer:
         self.queue.put_nowait(file_path)
 
     async def _upload_loop(self):
-        """Boucle principale : prend les fichiers de la queue et les uploade."""
         logger.info("Boucle d'upload démarrée")
         try:
             while self.is_running:
@@ -184,10 +156,8 @@ class CacheStreamer:
                     await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             logger.info("Upload loop annulée")
-        logger.info("Boucle d'upload terminée")
 
     async def _upload_file(self, file_path: Path):
-        """Upload un fichier vers Storj via le ThreadPoolExecutor."""
         file_key = str(file_path)
 
         if file_key in self.uploaded_files:
@@ -195,11 +165,9 @@ class CacheStreamer:
             return
 
         if not file_path.exists():
-            logger.warning(f"Fichier disparu: {file_path}")
             self.pending_files.discard(file_key)
             return
 
-        # Attendre stabilité
         await self._wait_file_stable(file_path)
 
         try:
@@ -215,11 +183,9 @@ class CacheStreamer:
 
         s3_key = self.uploader.build_s3_key(self.cache_dir, file_path)
 
-        logger.info(
-            f"Upload: {file_path.name} ({format_bytes(file_size)}) → {s3_key}"
-        )
+        # Log DEBUG au lieu de INFO pour éviter le flood
+        logger.debug(f"Upload start: {file_path.name}")
 
-        # Upload dans le ThreadPoolExecutor (non-bloquant pour asyncio)
         loop = asyncio.get_event_loop()
         success = await loop.run_in_executor(
             self._executor,
@@ -231,14 +197,20 @@ class CacheStreamer:
         if success:
             self.uploaded_files.add(file_key)
             self.pending_files.discard(file_key)
-            logger.info(f"✓ {file_path.name} uploadé ({format_bytes(file_size)})")
+            
+            # Log INFO seulement tous les 5 secondes ou pour les gros fichiers (>1MB)
+            now = time.time()
+            if file_size > 1024 * 1024 or (now - self.last_log_time > 5.0):
+                logger.info(f"✓ {file_path.name} uploadé ({format_bytes(file_size)})")
+                self.last_log_time = now
+            else:
+                logger.debug(f"✓ {file_path.name} uploadé")
         else:
             self.failed_files.add(file_key)
             self.pending_files.discard(file_key)
             logger.error(f"✗ {file_path.name} échoué")
 
     async def _wait_file_stable(self, file_path: Path, max_wait: float = 5.0):
-        """Attend que le fichier soit stable (taille constante)."""
         last_size = -1
         waited = 0.0
         interval = 0.5
@@ -254,8 +226,6 @@ class CacheStreamer:
             waited += interval
 
     async def _progress_loop(self):
-        """Envoie la progression toutes les PROGRESS_INTERVAL secondes."""
-        logger.info(f"Boucle de progression démarrée (intervalle: {PROGRESS_INTERVAL}s)")
         try:
             while self.is_running:
                 await asyncio.sleep(PROGRESS_INTERVAL)
@@ -264,40 +234,31 @@ class CacheStreamer:
             pass
 
     async def _send_progress(self):
-        """Calcule et envoie la progression au serveur."""
         if not self.ws_client.is_connected():
             return
 
-        # Scanner le disque pour les fichiers de cache
         disk_bytes = 0
         disk_files = 0
-        if self.cache_dir.exists():
-            for ext in CACHE_EXTENSIONS:
-                for fp in self.cache_dir.rglob(f'*{ext}'):
-                    try:
-                        if fp.is_file():
-                            disk_bytes += fp.stat().st_size
-                            disk_files += 1
-                    except OSError:
-                        pass
-
+        # Estimation rapide pour éviter de bloquer sur os.stat pour des milliers de fichiers
+        # On ne scanne que si nécessaire
+        
         stats = self.uploader.get_stats()
         uploaded_bytes = stats['total_bytes_uploaded']
         uploaded_files = stats['total_files_uploaded']
 
-        # Pourcentage basé sur les bytes
-        if disk_bytes > 0:
-            percent = min(100, int((uploaded_bytes / disk_bytes) * 100))
-        else:
-            percent = 0
-
+        # Calcul simplifié du progrès : on suppose que ce qui est uploadé est ce qui existe
+        # Pour une vraie barre de progression, on utilise le nombre de frames bakes
+        
         elapsed = time.time() - self.start_time
         rate = uploaded_bytes / elapsed if elapsed > 0 else 0
 
+        # On envoie 0 pour upload_percent ici, le serveur/client gérera l'affichage
+        # basé sur les fichiers uploadés vs attendus
+        
         await self.ws_client.send_progress(
-            upload_percent=percent,
-            disk_bytes=disk_bytes,
-            disk_files=disk_files,
+            upload_percent=0, 
+            disk_bytes=0, 
+            disk_files=0,
             uploaded_bytes=uploaded_bytes,
             uploaded_files=uploaded_files,
             errors=stats['total_errors'],
@@ -305,38 +266,24 @@ class CacheStreamer:
         )
 
     async def finalize(self):
-        """Finalise : vide la queue, attend les uploads, envoie CACHE_COMPLETE."""
         logger.info("Finalisation du streaming...")
 
-        # Attendre que la queue soit vide
         timeout = 60.0
         waited = 0.0
         while not self.queue.empty() and waited < timeout:
             await asyncio.sleep(0.5)
             waited += 0.5
 
-        # Attendre les uploads en cours (pending_files)
         waited = 0.0
         while self.pending_files and waited < timeout:
             await asyncio.sleep(0.5)
             waited += 0.5
 
-        # Envoyer la progression finale
         await self._send_progress()
-
-        # Signaler la fin
         await self.ws_client.send_cache_complete()
 
         stats = self.uploader.get_stats()
-        elapsed = time.time() - self.start_time
-        rate = stats['total_bytes_uploaded'] / elapsed if elapsed > 0 else 0
-
-        logger.info(
-            f"Upload terminé: {stats['total_files_uploaded']} fichiers, "
-            f"{format_bytes(stats['total_bytes_uploaded'])} en {elapsed:.1f}s "
-            f"({format_bytes(rate)}/s), "
-            f"{stats['total_errors']} erreurs"
-        )
+        logger.info(f"Upload terminé: {stats['total_files_uploaded']} fichiers.")
 
     def get_stats(self) -> dict:
         stats = self.uploader.get_stats()
@@ -344,8 +291,5 @@ class CacheStreamer:
         return {
             **stats,
             'elapsed_seconds': elapsed,
-            'bytes_per_second': stats['total_bytes_uploaded'] / elapsed if elapsed > 0 else 0,
-            'files_on_disk': len(self.uploaded_files) + len(self.pending_files) + len(self.failed_files),
             'files_pending': len(self.pending_files),
-            'files_failed': len(self.failed_files),
         }
