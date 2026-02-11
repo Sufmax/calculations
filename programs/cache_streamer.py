@@ -24,10 +24,7 @@ CACHE_EXTENSIONS = {
     '.png', '.exr', '.abc', '.obj', '.ply',
 }
 
-# Intervalle entre les rapports de progression (secondes)
 PROGRESS_INTERVAL = 5.0
-
-# Nombre d'uploads parallèles
 UPLOAD_WORKERS = 3
 
 
@@ -183,7 +180,6 @@ class CacheStreamer:
 
         s3_key = self.uploader.build_s3_key(self.cache_dir, file_path)
 
-        # Log DEBUG au lieu de INFO pour éviter le flood
         logger.debug(f"Upload start: {file_path.name}")
 
         loop = asyncio.get_event_loop()
@@ -198,7 +194,6 @@ class CacheStreamer:
             self.uploaded_files.add(file_key)
             self.pending_files.discard(file_key)
             
-            # Log INFO seulement tous les 5 secondes ou pour les gros fichiers (>1MB)
             now = time.time()
             if file_size > 1024 * 1024 or (now - self.last_log_time > 5.0):
                 logger.info(f"✓ {file_path.name} uploadé ({format_bytes(file_size)})")
@@ -233,37 +228,65 @@ class CacheStreamer:
         except asyncio.CancelledError:
             pass
 
-    async def _send_progress(self):
-        if not self.ws_client.is_connected():
-            return
+    def _get_disk_usage(self):
+        """Fonction synchrone pour scanner le disque (exécutée dans thread)."""
+        total_bytes = 0
+        total_files = 0
+        if self.cache_dir.exists():
+            for ext in CACHE_EXTENSIONS:
+                for fp in self.cache_dir.rglob(f'*{ext}'):
+                    try:
+                        if fp.is_file():
+                            total_bytes += fp.stat().st_size
+                            total_files += 1
+                    except OSError:
+                        pass
+        return total_bytes, total_files
 
-        disk_bytes = 0
-        disk_files = 0
-        # Estimation rapide pour éviter de bloquer sur os.stat pour des milliers de fichiers
-        # On ne scanne que si nécessaire
-        
+    async def _send_progress(self):
         stats = self.uploader.get_stats()
         uploaded_bytes = stats['total_bytes_uploaded']
         uploaded_files = stats['total_files_uploaded']
+        errors = stats['total_errors']
 
-        # Calcul simplifié du progrès : on suppose que ce qui est uploadé est ce qui existe
-        # Pour une vraie barre de progression, on utilise le nombre de frames bakes
-        
+        # Scan disque en thread séparé pour ne pas bloquer
+        loop = asyncio.get_running_loop()
+        try:
+            disk_bytes, disk_files = await loop.run_in_executor(
+                None, self._get_disk_usage
+            )
+        except Exception as e:
+            logger.warning(f"Erreur scan disque: {e}")
+            disk_bytes = uploaded_bytes
+            disk_files = uploaded_files
+
         elapsed = time.time() - self.start_time
         rate = uploaded_bytes / elapsed if elapsed > 0 else 0
 
-        # On envoie 0 pour upload_percent ici, le serveur/client gérera l'affichage
-        # basé sur les fichiers uploadés vs attendus
-        
-        await self.ws_client.send_progress(
-            upload_percent=0, 
-            disk_bytes=0, 
-            disk_files=0,
-            uploaded_bytes=uploaded_bytes,
-            uploaded_files=uploaded_files,
-            errors=stats['total_errors'],
-            rate_bytes_per_sec=rate,
-        )
+        percent = 0
+        if disk_bytes > 0:
+            percent = min(100, int((uploaded_bytes / disk_bytes) * 100))
+        elif uploaded_files > 0 and disk_files == 0:
+            percent = 100
+
+        if int(elapsed) % 30 == 0 or percent == 100:
+             logger.info(
+                 f"Status: {percent}% | "
+                 f"Disque: {format_bytes(disk_bytes)} ({disk_files} f) | "
+                 f"Envoyé: {format_bytes(uploaded_bytes)} ({uploaded_files} f) | "
+                 f"Vitesse: {format_bytes(rate)}/s"
+             )
+
+        if self.ws_client.is_connected():
+            await self.ws_client.send_progress(
+                upload_percent=percent,
+                disk_bytes=disk_bytes,
+                disk_files=disk_files,
+                uploaded_bytes=uploaded_bytes,
+                uploaded_files=uploaded_files,
+                errors=errors,
+                rate_bytes_per_sec=rate,
+            )
 
     async def finalize(self):
         logger.info("Finalisation du streaming...")

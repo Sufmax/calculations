@@ -32,11 +32,7 @@ CONTENT_TYPES: Dict[str, str] = {
 
 
 class S3Uploader:
-    """Client S3 direct avec AWS Signature V4.
-
-    Utilisé par la VM pour uploader les fichiers de cache directement
-    vers Storj, sans passer par le Worker Cloudflare.
-    """
+    """Client S3 direct avec AWS Signature V4."""
 
     def __init__(
         self,
@@ -72,18 +68,7 @@ class S3Uploader:
         metadata: Optional[Dict[str, str]] = None,
         max_retries: int = 3,
     ) -> bool:
-        """Upload un fichier vers Storj S3.
-
-        Args:
-            file_path: Chemin local du fichier
-            s3_key: Clé S3 complète (ex: cache/vm_007/fluids/data.vdb)
-            content_type: Type MIME (auto-détecté si None)
-            metadata: Métadonnées x-amz-meta-*
-            max_retries: Nombre de tentatives
-
-        Returns:
-            True si l'upload a réussi
-        """
+        """Upload un fichier vers Storj S3."""
         if not file_path.exists():
             logger.warning(f"Fichier introuvable: {file_path}")
             return False
@@ -123,13 +108,8 @@ class S3Uploader:
         return False
 
     def build_s3_key(self, cache_dir: Path, file_path: Path) -> str:
-        """Construit la clé S3 à partir du chemin local relatif au cache_dir.
-
-        Ex: cache_dir=/work/cache, file_path=/work/cache/fluids/data_0001.vdb
-            → cache/vm_007/fluids/data_0001.vdb
-        """
+        """Construit la clé S3 à partir du chemin local relatif."""
         relative = file_path.relative_to(cache_dir)
-        # Normaliser les séparateurs Windows → /
         rel_posix = relative.as_posix()
         return f"{self.cache_prefix}{rel_posix}"
 
@@ -145,18 +125,13 @@ class S3Uploader:
         amz_date = now.strftime('%Y%m%dT%H%M%SZ')
         date_stamp = now.strftime('%Y%m%d')
 
-        # Encoder la clé segment par segment
         encoded_key = '/'.join(
             urllib.parse.quote(seg, safe='') for seg in key.split('/')
         )
 
-        # URL complète
         url = f"{self.endpoint}/{self.bucket}/{encoded_key}"
-
-        # Hash du payload
         payload_hash = hashlib.sha256(data).hexdigest()
 
-        # Headers à signer (lowercase, triés)
         headers_to_sign: Dict[str, str] = {
             'content-length': str(len(data)),
             'content-type': content_type,
@@ -165,11 +140,9 @@ class S3Uploader:
             'x-amz-date': amz_date,
         }
 
-        # Ajouter les métadonnées
         for meta_key, meta_value in metadata.items():
             headers_to_sign[f'x-amz-meta-{meta_key.lower()}'] = meta_value
 
-        # Canonical request
         sorted_headers = sorted(headers_to_sign.items())
         canonical_headers = ''.join(f'{k}:{v}\n' for k, v in sorted_headers)
         signed_headers_list = ';'.join(k for k, _ in sorted_headers)
@@ -177,13 +150,12 @@ class S3Uploader:
         canonical_request = '\n'.join([
             'PUT',
             f'/{self.bucket}/{encoded_key}',
-            '',  # query string vide
+            '',
             canonical_headers,
             signed_headers_list,
             payload_hash,
         ])
 
-        # String to sign
         credential_scope = f'{date_stamp}/{self.region}/s3/aws4_request'
         canonical_hash = hashlib.sha256(
             canonical_request.encode('utf-8')
@@ -196,17 +168,13 @@ class S3Uploader:
             canonical_hash,
         ])
 
-        # Signing key
         signing_key = self._get_signing_key(date_stamp)
-
-        # Signature
         signature = hmac.new(
             signing_key,
             string_to_sign.encode('utf-8'),
             hashlib.sha256,
         ).hexdigest()
 
-        # Authorization header
         authorization = (
             f'AWS4-HMAC-SHA256 '
             f'Credential={self.access_key_id}/{credential_scope}, '
@@ -214,7 +182,6 @@ class S3Uploader:
             f'Signature={signature}'
         )
 
-        # Headers de la requête HTTP (sans Host — urllib le met automatiquement)
         request_headers = {
             'Content-Type': content_type,
             'Content-Length': str(len(data)),
@@ -225,7 +192,6 @@ class S3Uploader:
         for meta_key, meta_value in metadata.items():
             request_headers[f'x-amz-meta-{meta_key.lower()}'] = meta_value
 
-        # Requête PUT
         req = urllib.request.Request(
             url,
             data=data,
@@ -247,7 +213,6 @@ class S3Uploader:
             ) from e
 
     def _get_signing_key(self, date_stamp: str) -> bytes:
-        """Dérive la clé de signature AWS4."""
         k_date = self._hmac_sha256(
             f'AWS4{self.secret_access_key}'.encode('utf-8'),
             date_stamp,
