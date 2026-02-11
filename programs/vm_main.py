@@ -10,7 +10,7 @@ from urllib.request import urlopen
 from urllib.error import URLError
 
 from config import Config
-from utils import setup_logging, decode_base64_to_file
+from utils import setup_logging
 from ws_client import WSClient
 from cache_streamer import CacheStreamer
 from blender_runner import BlenderRunner
@@ -22,7 +22,6 @@ cache_streamer: CacheStreamer = None
 blender_runner: BlenderRunner = None
 heartbeat_task: asyncio.Task = None
 shutdown_event = asyncio.Event()
-s3_credentials: dict = None
 _blender_done_event = asyncio.Event()
 
 
@@ -38,28 +37,21 @@ async def heartbeat_loop():
 
 
 async def on_authenticated(message: dict):
-    logger.info(f"Authentifié.")
+    logger.info("Authentifié.")
     global heartbeat_task
     heartbeat_task = asyncio.create_task(heartbeat_loop())
 
 
 async def on_message(message: dict):
-    global s3_credentials
     msg_type = message.get('type')
 
-    if msg_type == 'S3_CREDENTIALS':
-        s3_credentials = {
-            'endpoint': message.get('endpoint'),
-            'bucket': message.get('bucket'),
-            'region': message.get('region'),
-            'accessKeyId': message.get('accessKeyId'),
-            'secretAccessKey': message.get('secretAccessKey'),
-            'cachePrefix': message.get('cachePrefix', 'cache/'),
-        }
-        logger.info(f"Credentials S3 reçues: prefix={s3_credentials['cachePrefix']}")
-
-    elif msg_type == 'BLEND_FILE_URL':
+    if msg_type == 'BLEND_FILE_URL':
         await handle_blend_file_url(message)
+
+    elif msg_type == 'UPLOAD_URLS':
+        # Transmettre les URLs au cache_streamer
+        if cache_streamer is not None:
+            cache_streamer.handle_upload_urls(message)
 
     elif msg_type == 'TERMINATE':
         reason = message.get('reason', 'Non spécifié')
@@ -100,15 +92,10 @@ async def start_blender():
     global cache_streamer, blender_runner
     await asyncio.sleep(2.0)
 
-    if s3_credentials is None:
-        logger.error("Pas de credentials S3 reçues.")
-        _blender_done_event.set()
-        return
-
     logger.info("Démarrage Blender + Streamer...")
 
     try:
-        cache_streamer = CacheStreamer(Config.CACHE_DIR, ws_client, s3_credentials)
+        cache_streamer = CacheStreamer(Config.CACHE_DIR, ws_client)
         cache_streamer.start()
 
         blender_runner = BlenderRunner(Config.BLEND_FILE, Config.CACHE_DIR)
@@ -162,7 +149,7 @@ async def main():
 
     try:
         Config.validate()
-        
+
         loop = asyncio.get_running_loop()
         try:
             import signal
