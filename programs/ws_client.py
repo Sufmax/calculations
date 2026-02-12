@@ -1,18 +1,21 @@
 """
 Client WebSocket robuste pour Blender Coordinator.
+Supporte envoi thread-safe depuis les threads du pipeline.
 """
 
 import asyncio
 import json
 import logging
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Any, Dict
 import websockets
 from websockets.client import WebSocketClientProtocol
 
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+PROTOCOL_VERSION = 2
 
 
 class WSClient:
@@ -26,20 +29,21 @@ class WSClient:
         self.is_authenticated = False
 
         self.on_authenticated: Optional[Callable] = None
-        self.on_message: Optional[Callable[[dict], None]] = None
+        self.on_message: Optional[Callable[[dict], Any]] = None
         self.on_disconnected: Optional[Callable] = None
         self.on_error: Optional[Callable[[Exception], None]] = None
 
-        self._total_bytes_sent = 0
-        self._total_messages_sent = 0
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._server_time_delta_ms: int = 0
 
     async def connect(self):
         self.is_running = True
+        self._loop = asyncio.get_running_loop()
 
         while self.is_running:
             try:
                 logger.info(f"Connexion à {self.url}...")
-                
+
                 async with websockets.connect(
                     self.url,
                     ping_interval=20,
@@ -51,38 +55,36 @@ class WSClient:
                     self.reconnect_attempts = 0
                     logger.info("Connecté au serveur")
 
-                    if self.token:
-                        await self.resume_session()
-                    else:
-                        await self.authenticate()
-
+                    await self.authenticate()
                     await self.receive_loop()
 
             except (websockets.exceptions.ConnectionClosed, OSError) as e:
                 logger.warning(f"Connexion fermée/perdue: {e}")
             except Exception as e:
                 logger.error(f"Erreur connexion: {e}", exc_info=True)
-            
+                if self.on_error:
+                    self.on_error(e)
+
             self.is_authenticated = False
-            
+
             if self.is_running:
                 self.reconnect_attempts += 1
                 delay = min(30, Config.RECONNECT_DELAY * self.reconnect_attempts)
                 logger.info(f"Reconnexion dans {delay}s (tentative {self.reconnect_attempts})")
                 await asyncio.sleep(delay)
 
+        if self.on_disconnected:
+            self.on_disconnected()
+
     async def authenticate(self):
-        logger.info("Authentification (nouveau token)...")
+        logger.info("Authentification...")
         await self.send({
             'type': 'AUTH',
             'password': self.password,
-            'timestamp': int(time.time() * 1000)
+            'timestamp': int(time.time() * 1000),
+            'protocolVersion': PROTOCOL_VERSION,
         })
         await self._wait_for_auth_response()
-
-    async def resume_session(self):
-        logger.info(f"Reprise de session (token: {self.token[:8]}...)...")
-        await self.authenticate()
 
     async def _wait_for_auth_response(self):
         try:
@@ -90,13 +92,15 @@ class WSClient:
             message = json.loads(response)
 
             if message.get('type') == 'AUTH_SUCCESS':
-                new_token = message.get('token')
-                if self.token and self.token != new_token:
-                    logger.warning("Nouveau token reçu (session réinitialisée)")
-                
-                self.token = new_token
+                self.token = message.get('token')
                 self.is_authenticated = True
-                logger.info(f"Authentifié (token: {self.token[:8]}...)")
+
+                server_time = int(message.get('serverTime') or 0)
+                if server_time > 0:
+                    local_time = int(time.time() * 1000)
+                    self._server_time_delta_ms = server_time - local_time
+
+                logger.info(f"Authentifié (token: {self.token[:8]}..., proto={message.get('protocolVersion')})")
 
                 if self.on_authenticated:
                     await self.on_authenticated(message)
@@ -117,57 +121,41 @@ class WSClient:
             except websockets.exceptions.ConnectionClosed:
                 break
             except Exception as e:
-                logger.error(f"Erreur receive_loop: {e}")
+                logger.error(f"Erreur receive_loop: {e}", exc_info=True)
                 break
 
     async def handle_message(self, message: dict):
         msg_type = message.get('type')
 
-        if msg_type == 'BLEND_FILE_URL':
-            logger.info("URL .blend reçue")
-        elif msg_type == 'S3_CREDENTIALS':
-            logger.info("Credentials S3 reçues")
-        elif msg_type == 'TERMINATE':
+        if msg_type == 'TERMINATE':
             logger.warning(f"Demande de terminaison: {message.get('reason')}")
             self.is_running = False
-        elif msg_type != 'PONG':
-            logger.debug(f"Message reçu: {msg_type}")
 
         if self.on_message:
             await self.on_message(message)
 
-    async def send(self, message: dict):
+    async def send(self, message: dict) -> bool:
         if not self.ws or not self.is_running:
             return False
         try:
             await self.ws.send(json.dumps(message))
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Erreur send(): {e}")
+            return False
+
+    def send_threadsafe(self, message: dict) -> bool:
+        if not self._loop or not self.is_running:
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(self.send(message), self._loop)
+            return True
+        except Exception as e:
+            logger.debug(f"Erreur send_threadsafe(): {e}")
             return False
 
     async def send_heartbeat(self):
         return await self.send({'type': 'ALIVE'})
-
-    async def send_progress(
-        self,
-        upload_percent: int,
-        disk_bytes: int,
-        disk_files: int,
-        uploaded_bytes: int,
-        uploaded_files: int,
-        errors: int,
-        rate_bytes_per_sec: float,
-    ):
-        return await self.send({
-            'type': 'PROGRESS_UPDATE',
-            'uploadPercent': upload_percent,
-            'diskBytes': disk_bytes,
-            'diskFiles': disk_files,
-            'uploadedBytes': uploaded_bytes,
-            'uploadedFiles': uploaded_files,
-            'errors': errors,
-            'rateBytesPerSec': int(rate_bytes_per_sec),
-        })
 
     async def send_cache_complete(self):
         return await self.send({'type': 'CACHE_COMPLETE'})
@@ -178,8 +166,11 @@ class WSClient:
     def disconnect(self):
         logger.info("Déconnexion...")
         self.is_running = False
-        if self.ws:
-            asyncio.create_task(self.ws.close())
+        if self.ws and self._loop:
+            try:
+                asyncio.run_coroutine_threadsafe(self.ws.close(), self._loop)
+            except Exception:
+                pass
 
     def is_connected(self) -> bool:
         return self.ws is not None and self.is_authenticated
