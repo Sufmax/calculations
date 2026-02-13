@@ -1,10 +1,9 @@
 """
 pipeline.py — Pipeline 3 threads pour le cache Blender (batches tar.zst).
-Fix Storj 411: upload HTTP direct avec urllib3 (Content-Length garanti).
+Upload HTTP direct via urllib3 + signature AWS v4 (contourne bug botocore 1.42).
 """
 
 import hashlib
-import io
 import logging
 import re
 import threading
@@ -15,11 +14,9 @@ from queue import Queue, Empty
 from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse
 
-import boto3
 import botocore.auth
+import botocore.awsrequest
 import botocore.credentials
-from botocore.config import Config as BotoConfig
-
 import urllib3
 
 from watchdog.observers import Observer
@@ -41,7 +38,8 @@ FRAME_PATTERNS = [
     re.compile(r'_(\d{4,6})\.bphys$'),
     re.compile(r'_(\d{4,6})\.vdb$'),
     re.compile(r'data_(\d{4,6})\.vdb$'),
-    re.compile(r'_(\d+)\.\w+$'),
+    re.compile(r'_(\d{4,6})-\d{4,6}\.abc$'),   # Alembic chunked : Obj_0001-0010.abc
+    re.compile(r'_(\d+)\.\w+$'),                 # fallback générique
 ]
 
 
@@ -153,12 +151,10 @@ class BatchCompressor:
         self.dict_manager = dict_manager
         self.ws_client = ws_client
         self.work_dir = work_dir
-
         self._pending_files: List[Path] = []
         self._pending_frames: List[int] = []
         self._dict_training_samples: List[Path] = []
         self._dict_trained = False
-
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self.batch_size = Config.DEFAULT_BATCH_SIZE
@@ -199,20 +195,17 @@ class BatchCompressor:
                     self._add_file(fp)
                 except Empty:
                     pass
-
                 while not self.frame_queue.empty():
                     try:
                         fp = self.frame_queue.get_nowait()
                         self._add_file(fp)
                     except Empty:
                         break
-
                 if len(self._pending_files) >= self.batch_size:
                     self._compress_batch()
             except Exception as e:
                 logger.error(f"Compressor error: {e}", exc_info=True)
                 time.sleep(1.0)
-
         if self._pending_files:
             self._compress_batch()
 
@@ -227,26 +220,20 @@ class BatchCompressor:
     def _compress_batch(self):
         if not self._pending_files:
             return
-
         if not self._dict_trained and len(self._dict_training_samples) >= Config.ZSTD_MIN_TRAINING_SAMPLES:
             if self.dict_manager.train(self._dict_training_samples):
                 self.dict_manager.save_to_file(Config.DICT_FILE)
                 self._dict_trained = True
-
         files = self._pending_files[:]
         frames = self._pending_frames[:]
         self._pending_files.clear()
         self._pending_frames.clear()
-
         batch = self.progress.create_batch(frames)
         compressed, raw_size = compress_batch(files, self.cache_dir, self.dict_manager)
-
         self.progress.register_compressed(batch.batch_id, len(compressed), raw_size)
-
         self.work_dir.mkdir(parents=True, exist_ok=True)
         batch_file = self.work_dir / f"batch_{batch.batch_id:04d}.tar.zst"
         batch_file.write_bytes(compressed)
-
         if self.ws_client and self.ws_client.is_connected():
             self.ws_client.send_threadsafe({
                 'type': 'PROGRESS_COMPRESSED',
@@ -256,7 +243,6 @@ class BatchCompressor:
                 'rawSize': int(raw_size),
                 'timestamp': time.time(),
             })
-
         self.batch_queue.put((batch.batch_id, batch_file, frames))
         self.update_batch_size()
 
@@ -270,19 +256,13 @@ class StorjUploader:
         self._region = region
         self._credentials = botocore.credentials.Credentials(access_key, secret_key)
         self._signer = botocore.auth.SigV4Auth(self._credentials, 's3', self._region)
-        self._http = urllib3.PoolManager(
-            num_pools=4,
-            maxsize=4,
-            retries=urllib3.Retry(total=3, backoff_factor=1.0),
-        )
+        self._http = urllib3.PoolManager(num_pools=4, maxsize=4)
         parsed = urlparse(self._endpoint)
         self._host = parsed.netloc
 
     def put_object(self, key: str, data: bytes, content_type: str = 'application/octet-stream', metadata: Optional[Dict[str, str]] = None) -> Dict:
-        """PUT un objet avec Content-Length explicite."""
         url = f"{self._endpoint}/{self._bucket}/{key}"
         content_sha256 = hashlib.sha256(data).hexdigest()
-
         headers = {
             'Host': self._host,
             'Content-Type': content_type,
@@ -290,68 +270,27 @@ class StorjUploader:
             'x-amz-content-sha256': content_sha256,
             'x-amz-date': datetime.utcnow().strftime('%Y%m%dT%H%M%SZ'),
         }
-
         if metadata:
             for k, v in metadata.items():
                 headers[f'x-amz-meta-{k}'] = v
-
-        # Signer la requête
-        request = botocore.awsrequest.AWSRequest(
-            method='PUT',
-            url=url,
-            headers=headers,
-            data=data,
-        )
+        request = botocore.awsrequest.AWSRequest(method='PUT', url=url, headers=headers, data=data)
         self._signer.add_auth(request)
-
-        # Envoyer
-        response = self._http.urlopen(
-            'PUT',
-            url,
-            body=data,
-            headers=dict(request.headers),
-            preload_content=True,
-        )
-
+        response = self._http.urlopen('PUT', url, body=data, headers=dict(request.headers), preload_content=True)
         if response.status not in (200, 201, 204):
-            raise Exception(
-                f"Storj PUT failed: HTTP {response.status} — {response.data.decode('utf-8', errors='replace')[:500]}"
-            )
-
-        return {
-            'ETag': response.headers.get('ETag', '').strip('"'),
-            'status': response.status,
-        }
+            raise Exception(f"Storj PUT HTTP {response.status} — {response.data.decode('utf-8', errors='replace')[:500]}")
+        return {'ETag': response.headers.get('ETag', '').strip('"'), 'status': response.status}
 
     def head_object(self, key: str) -> Dict:
-        """HEAD un objet."""
         url = f"{self._endpoint}/{self._bucket}/{key}"
-
         headers = {
             'Host': self._host,
             'x-amz-content-sha256': hashlib.sha256(b'').hexdigest(),
             'x-amz-date': datetime.utcnow().strftime('%Y%m%dT%H%M%SZ'),
         }
-
-        request = botocore.awsrequest.AWSRequest(
-            method='HEAD',
-            url=url,
-            headers=headers,
-        )
+        request = botocore.awsrequest.AWSRequest(method='HEAD', url=url, headers=headers)
         self._signer.add_auth(request)
-
-        response = self._http.urlopen(
-            'HEAD',
-            url,
-            headers=dict(request.headers),
-            preload_content=True,
-        )
-
-        return {
-            'ETag': response.headers.get('ETag', '').strip('"'),
-            'ContentLength': int(response.headers.get('Content-Length', 0)),
-            'status': response.status,
-        }
+        response = self._http.urlopen('HEAD', url, headers=dict(request.headers), preload_content=True)
+        return {'ETag': response.headers.get('ETag', '').strip('"'), 'ContentLength': int(response.headers.get('Content-Length', 0))}
 
 
 class BatchUploader:
@@ -360,7 +299,6 @@ class BatchUploader:
         self.progress = progress
         self.ws_client = ws_client
         self.cache_prefix = cache_prefix
-
         self._storj = StorjUploader(
             endpoint=s3_credentials['endpoint'],
             access_key=s3_credentials['accessKeyId'],
@@ -383,11 +321,7 @@ class BatchUploader:
     def upload_dict(self, dict_bytes: bytes, work_dir: Path):
         key = f"{self.cache_prefix}dictionary.zstd"
         try:
-            self._storj.put_object(
-                key=key,
-                data=dict_bytes,
-                metadata={'type': 'zstd-dictionary'},
-            )
+            self._storj.put_object(key=key, data=dict_bytes, metadata={'type': 'zstd-dictionary'})
             self._notify_secured(frames=[], batch_id=0, r2_key=key, upload_speed_bps=int(self.progress.upload_speed_bps))
         except Exception as e:
             logger.error(f"Erreur upload dictionnaire: {e}", exc_info=True)
@@ -405,43 +339,40 @@ class BatchUploader:
 
     def _upload_batch(self, batch_id: int, batch_file: Path, frames: List[int]):
         key = f"{self.cache_prefix}batch_{batch_id:04d}.tar.zst"
-        start = time.time()
+        max_retries = Config.UPLOAD_MAX_RETRIES
 
-        try:
-            data = batch_file.read_bytes()
-
-            result = self._storj.put_object(
-                key=key,
-                data=data,
-                metadata={
-                    'batch-id': str(batch_id),
-                    'frames': ','.join(str(f) for f in frames),
-                    'frame-count': str(len(frames)),
-                },
-            )
-
-            duration = time.time() - start
-            self.progress.register_secured(batch_id, key, duration)
-
-            etag = result.get('ETag', '')
-
-            self._notify_secured(
-                frames=frames,
-                batch_id=batch_id,
-                r2_key=key,
-                upload_speed_bps=int(self.progress.upload_speed_bps),
-                size=len(data),
-                etag=etag,
-            )
-
+        for attempt in range(1, max_retries + 1):
+            start = time.time()
             try:
-                batch_file.unlink()
-            except OSError:
-                pass
+                data = batch_file.read_bytes()
+                result = self._storj.put_object(
+                    key=key, data=data,
+                    metadata={
+                        'batch-id': str(batch_id),
+                        'frames': ','.join(str(f) for f in frames),
+                        'frame-count': str(len(frames)),
+                    },
+                )
+                duration = time.time() - start
+                self.progress.register_secured(batch_id, key, duration)
+                etag = result.get('ETag', '')
+                self._notify_secured(frames=frames, batch_id=batch_id, r2_key=key,
+                                     upload_speed_bps=int(self.progress.upload_speed_bps),
+                                     size=len(data), etag=etag)
+                try:
+                    batch_file.unlink()
+                except OSError:
+                    pass
+                return  # Succès
 
-        except Exception as e:
-            self.progress.register_batch_failed(batch_id)
-            logger.error(f"Erreur upload batch #{batch_id}: {e}")
+            except Exception as e:
+                if attempt < max_retries:
+                    delay = 2 ** attempt
+                    logger.warning(f"Upload batch #{batch_id} échoué (tentative {attempt}/{max_retries}), retry dans {delay}s: {e}")
+                    time.sleep(delay)
+                else:
+                    self.progress.register_batch_failed(batch_id)
+                    logger.error(f"Erreur upload batch #{batch_id} après {max_retries} tentatives: {e}")
 
     def _notify_secured(self, frames: List[int], batch_id: int, r2_key: str, upload_speed_bps: int, size: Optional[int] = None, etag: Optional[str] = None):
         if not self.ws_client or not self.ws_client.is_connected():
@@ -467,23 +398,18 @@ class Pipeline:
         self.ws_client = ws_client
         self.s3_credentials = s3_credentials
         self.cache_prefix = s3_credentials.get('cachePrefix', 'cache/')
-
         self.work_dir = work_dir or (Path(__file__).parent / 'work' / 'batches')
         self._frame_queue: Queue = Queue()
         self._batch_queue: Queue = Queue()
-
         self.progress = ProgressTracker(total_frames=total_frames, already_secured=already_secured)
-
         self.dict_manager = ZstdDictManager()
         if dict_bytes:
             self.dict_manager.load_from_bytes(dict_bytes)
         elif Config.DICT_FILE.exists():
             self.dict_manager.load_from_file(Config.DICT_FILE)
-
         self.watcher = FrameWatcher(cache_dir, self._frame_queue, self.progress, ws_client, already_secured)
         self.compressor = BatchCompressor(cache_dir, self._frame_queue, self._batch_queue, self.progress, self.dict_manager, ws_client, self.work_dir)
         self.uploader = BatchUploader(self._batch_queue, self.progress, s3_credentials, ws_client, self.cache_prefix)
-
         self._stop_event = threading.Event()
         self._progress_thread: Optional[threading.Thread] = None
 

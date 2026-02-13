@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-bake_all.py — Script Blender (exécution en mode background)
+bake_all.py — Script Blender 4.2 LTS (exécution en mode background)
 
 Objectif :
-- Forcer Blender à écrire TOUS les caches dans un répertoire unique (--cache-dir)
-- Exploiter au maximum les threads CPU via OpenMP (Mantaflow) et mode FIXED
-- Produire un cache_manifest.json pour validation par le pipeline
-- Supporte la reprise : NE PAS supprimer les caches existants par défaut
+- Bake natif des Simulation Nodes (GeoNodes) — multi-threadé
+- Bake classique ptcache (particules, cloth, rigid body)
+- Bake Mantaflow (fluides/fumée)
+- Export Alembic chunked optionnel pour transfert vers machine de rendu
+- Tout dans un répertoire unique (--cache-dir)
 
 Interface :
   blender --background fichier.blend --python bake_all.py -- \
@@ -35,8 +36,12 @@ import bpy
 CACHE_SUBDIRS = ("ptcache", "fluids", "rigidbody", "alembic", "geonodes")
 RESERVE_THREADS = 2
 
-# Extensions de cache attendues par le pipeline (pipeline.py / FrameWatcher)
-CACHE_EXTENSIONS = {'.bphys', '.vdb', '.uni', '.gz', '.png', '.exr', '.abc', '.obj', '.ply'}
+CACHE_EXTENSIONS = {
+    '.bphys', '.vdb', '.uni', '.gz',
+    '.png', '.exr', '.abc', '.obj', '.ply',
+}
+
+ALEMBIC_CHUNK_FRAMES = int(os.environ.get('ALEMBIC_CHUNK_FRAMES', '10'))
 
 # ═══════════════════════════════════════════
 # État global interruption
@@ -47,7 +52,7 @@ _interrupt_count = 0
 
 
 # ═══════════════════════════════════════════
-# Logging (stdout uniquement — lu par blender_runner.py)
+# Logging (stdout — lu par blender_runner.py)
 # ═══════════════════════════════════════════
 
 def log(msg: str) -> None:
@@ -96,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     else:
         argv = []
 
-    parser = argparse.ArgumentParser(description="Blender bake-all helper")
+    parser = argparse.ArgumentParser(description="Blender 4.2 bake-all helper")
 
     parser.add_argument("--cache-dir", required=True,
                         help="Répertoire racine des caches")
@@ -107,8 +112,9 @@ def parse_args() -> argparse.Namespace:
                         dest="frame_end", type=int, default=None)
 
     parser.add_argument("--clear-existing", action="store_true",
-                        help="Supprime les caches avant bake (DANGEREUX)")
+                        help="Supprime les caches avant bake")
 
+    # Types de bake
     parser.add_argument("--bake-fluids", action="store_true", default=True)
     parser.add_argument("--no-bake-fluids", dest="bake_fluids", action="store_false")
 
@@ -117,6 +123,18 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--bake-cloth", action="store_true", default=True)
     parser.add_argument("--no-bake-cloth", dest="bake_cloth", action="store_false")
+
+    parser.add_argument("--bake-geonodes", action="store_true", default=True,
+                        help="Bake natif des Simulation Nodes (GeoNodes)")
+    parser.add_argument("--no-bake-geonodes", dest="bake_geonodes", action="store_false")
+
+    # Export Alembic (optionnel, pour transfert vers machine de rendu)
+    parser.add_argument("--export-alembic", action="store_true", default=False,
+                        help="Exporter aussi en Alembic (.abc) pour transfert")
+    parser.add_argument("--alembic-objects", type=str, default=None,
+                        help="Objets à exporter en Alembic (séparés par virgule)")
+    parser.add_argument("--alembic-chunk", type=int, default=ALEMBIC_CHUNK_FRAMES,
+                        help=f"Frames par chunk Alembic (défaut: {ALEMBIC_CHUNK_FRAMES})")
 
     parser.add_argument("--bake-threads", type=int, default=None)
     parser.add_argument("--strict", action="store_true")
@@ -138,6 +156,16 @@ def verify_blend_loaded() -> bool:
     return True
 
 
+def verify_blender_version() -> bool:
+    """Vérifie que Blender est en version 4.2+."""
+    major, minor = bpy.app.version[:2]
+    if major < 4 or (major == 4 and minor < 2):
+        err(f"Blender {bpy.app.version_string} détecté — version 4.2+ requise")
+        return False
+    log(f"Blender {bpy.app.version_string} — OK")
+    return True
+
+
 # ═══════════════════════════════════════════
 # Création répertoires de cache
 # ═══════════════════════════════════════════
@@ -152,15 +180,10 @@ def setup_cache_directories(cache_root: Path) -> Dict[str, Path]:
 
 
 # ═══════════════════════════════════════════
-# Symlink ptcache (fallback pour Blender qui écrit dans blendcache_<stem>)
+# Symlink ptcache
 # ═══════════════════════════════════════════
 
 def setup_ptcache_symlink(cache_root: Path) -> bool:
-    """
-    Crée un symlink blendcache_<stem> → <cache_root>/ptcache/
-    Blender écrit les ptcache dans blendcache_<blend_stem>/ à côté du .blend.
-    Le symlink redirige vers notre répertoire de cache unifié.
-    """
     blend_path = Path(bpy.data.filepath)
     if not blend_path.exists():
         return False
@@ -168,7 +191,6 @@ def setup_ptcache_symlink(cache_root: Path) -> bool:
     blendcache_dir = blend_path.parent / f"blendcache_{blend_path.stem}"
     target = cache_root / "ptcache"
 
-    # Vérifier si le symlink existe déjà et pointe au bon endroit
     if blendcache_dir.is_symlink():
         try:
             if blendcache_dir.resolve() == target.resolve():
@@ -180,14 +202,12 @@ def setup_ptcache_symlink(cache_root: Path) -> bool:
         except OSError:
             return False
 
-    # Supprimer si c'est un vrai dossier
     if blendcache_dir.is_dir() and not blendcache_dir.is_symlink():
         try:
             shutil.rmtree(str(blendcache_dir), ignore_errors=True)
         except OSError:
             return False
 
-    # Supprimer si c'est un fichier
     if blendcache_dir.exists() and not blendcache_dir.is_dir():
         try:
             blendcache_dir.unlink()
@@ -208,21 +228,13 @@ def setup_ptcache_symlink(cache_root: Path) -> bool:
 # ═══════════════════════════════════════════
 
 def configure_threading(scene: bpy.types.Scene, n_threads: int) -> None:
-    """
-    Configure le threading Blender.
-    Note : OMP_NUM_THREADS est déjà défini par blender_runner.py dans l'env
-    du subprocess AVANT le lancement. On le remet ici par sécurité mais
-    OpenMP l'a déjà lu au démarrage du processus.
-    """
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ.pop("OMP_PROC_BIND", None)
-
     try:
         scene.render.threads_mode = "FIXED"
         scene.render.threads = n_threads
     except Exception:
         pass
-
     log(f"Threading configuré : {n_threads} threads, mode=FIXED")
 
 
@@ -231,7 +243,6 @@ def configure_threading(scene: bpy.types.Scene, n_threads: int) -> None:
 # ═══════════════════════════════════════════
 
 def configure_fluid_domains(scene: bpy.types.Scene, fluids_dir: Path) -> int:
-    """Redirige tous les fluid domains vers fluids_dir."""
     count = 0
     for obj in scene.objects:
         for mod in obj.modifiers:
@@ -256,11 +267,10 @@ def configure_fluid_domains(scene: bpy.types.Scene, fluids_dir: Path) -> int:
 
 
 # ═══════════════════════════════════════════
-# Configuration des caches — Point Caches (ptcache)
+# Configuration des caches — Point Caches
 # ═══════════════════════════════════════════
 
-def _configure_single_point_cache(pc: Any, ptcache_dir: Path) -> bool:
-    """Configure un point_cache individuel pour écriture disque."""
+def _configure_single_point_cache(pc: Any) -> bool:
     try:
         if hasattr(pc, "use_disk_cache"):
             pc.use_disk_cache = True
@@ -268,49 +278,38 @@ def _configure_single_point_cache(pc: Any, ptcache_dir: Path) -> bool:
             pc.use_external = False
         if hasattr(pc, "use_library_path"):
             pc.use_library_path = False
-        # Redirection du chemin : Blender 3.x utilise filepath_raw
-        # pour les point caches quand use_external est False,
-        # le cache va dans blendcache_<stem>/ (géré par le symlink)
         return True
     except Exception as e:
         warn(f"Erreur configuration point_cache : {e}")
         return False
 
 
-def configure_disk_caches(scene: bpy.types.Scene, ptcache_dir: Path) -> int:
-    """Configure tous les point caches de la scène pour écriture disque."""
+def configure_disk_caches(scene: bpy.types.Scene) -> int:
     count = 0
-
-    # Rigid Body World
     rbw = getattr(scene, "rigidbody_world", None)
     if rbw and rbw.point_cache:
-        if _configure_single_point_cache(rbw.point_cache, ptcache_dir):
+        if _configure_single_point_cache(rbw.point_cache):
             count += 1
-
     for obj in scene.objects:
-        # Particle Systems
         for psys in getattr(obj, "particle_systems", []):
             if psys.point_cache:
-                if _configure_single_point_cache(psys.point_cache, ptcache_dir):
+                if _configure_single_point_cache(psys.point_cache):
                     count += 1
-
-        # Modifiers avec point_cache
         for mod in obj.modifiers:
             if mod.type in ("CLOTH", "SOFT_BODY"):
                 if mod.point_cache:
-                    if _configure_single_point_cache(mod.point_cache, ptcache_dir):
+                    if _configure_single_point_cache(mod.point_cache):
                         count += 1
             elif mod.type == "DYNAMIC_PAINT":
                 canvas = getattr(mod, "canvas_settings", None)
                 if canvas and hasattr(canvas, "canvas_surfaces"):
                     for surf in canvas.canvas_surfaces:
                         if surf.point_cache:
-                            if _configure_single_point_cache(surf.point_cache, ptcache_dir):
+                            if _configure_single_point_cache(surf.point_cache):
                                 count += 1
-            elif mod.type != "FLUID" and hasattr(mod, "point_cache") and mod.point_cache:
-                if _configure_single_point_cache(mod.point_cache, ptcache_dir):
+            elif mod.type not in ("FLUID", "NODES") and hasattr(mod, "point_cache") and mod.point_cache:
+                if _configure_single_point_cache(mod.point_cache):
                     count += 1
-
     log(f"  {count} caches disque configurés")
     return count
 
@@ -320,7 +319,6 @@ def configure_disk_caches(scene: bpy.types.Scene, ptcache_dir: Path) -> int:
 # ═══════════════════════════════════════════
 
 def clear_all_caches(scene: bpy.types.Scene) -> None:
-    """Supprime tous les bakes existants."""
     try:
         bpy.ops.ptcache.free_bake_all()
         log("  ptcache.free_bake_all() → OK")
@@ -337,13 +335,24 @@ def clear_all_caches(scene: bpy.types.Scene) -> None:
                 except Exception as e:
                     warn(f"  fluid.free_all() échoué ({obj.name}) : {e}")
 
+    # Clear les caches Simulation Nodes (Blender 4.2)
+    for obj in scene.objects:
+        for mod in obj.modifiers:
+            if mod.type == 'NODES' and mod.node_group:
+                try:
+                    bpy.context.view_layer.objects.active = obj
+                    obj.select_set(True)
+                    bpy.ops.object.simulation_nodes_cache_delete('INVOKE_DEFAULT')
+                    log(f"  GeoNodes cache supprimé : {obj.name}")
+                except Exception:
+                    pass
+
 
 # ═══════════════════════════════════════════
-# Bake — Point Caches (individuel par objet, plus robuste en background)
+# Context helper
 # ═══════════════════════════════════════════
 
 def _ensure_context(scene: bpy.types.Scene, obj: bpy.types.Object) -> bool:
-    """Configure le contexte Blender pour un objet (requis par bpy.ops en background)."""
     try:
         bpy.context.window.scene = scene
         bpy.context.view_layer.objects.active = obj
@@ -354,117 +363,33 @@ def _ensure_context(scene: bpy.types.Scene, obj: bpy.types.Object) -> bool:
         return False
 
 
-def bake_point_caches_individual(scene: bpy.types.Scene) -> Tuple[int, int]:
-    """
-    Bake les point caches un par un (plus robuste que bake_all en background).
-    Retourne (succès, échecs).
-    """
+# ═══════════════════════════════════════════
+# Bake — Point Caches
+# ═══════════════════════════════════════════
+
+def bake_point_caches(scene: bpy.types.Scene) -> Tuple[int, int]:
     if _interrupted:
         return 0, 0
-
     successes = 0
     failures = 0
-
-    # D'abord essayer bake_all (fonctionne pour la plupart des cas)
     try:
-        log(f"  ptcache.bake_all(bake=True)...")
+        log("  ptcache.bake_all(bake=True)...")
         bpy.ops.ptcache.bake_all(bake=True)
-        # Compter les caches qui ont été baked
         for obj in scene.objects:
             for psys in getattr(obj, "particle_systems", []):
                 if psys.point_cache and psys.point_cache.is_baked:
                     successes += 1
             for mod in obj.modifiers:
-                if hasattr(mod, "point_cache") and mod.point_cache:
+                if mod.type not in ("FLUID", "NODES") and hasattr(mod, "point_cache") and mod.point_cache:
                     if mod.point_cache.is_baked:
                         successes += 1
         rbw = getattr(scene, "rigidbody_world", None)
         if rbw and rbw.point_cache and rbw.point_cache.is_baked:
             successes += 1
-
         log(f"  ptcache.bake_all → {successes} caches baked")
-        return successes, failures
-
     except Exception as e:
         warn(f"  ptcache.bake_all échoué : {e}")
-        warn(f"  Fallback : bake individuel par objet...")
-
-    # Fallback : bake individuel
-    # Rigid Body World
-    rbw = getattr(scene, "rigidbody_world", None)
-    if rbw and rbw.point_cache:
-        if _interrupted:
-            return successes, failures
-        try:
-            pc = rbw.point_cache
-            if not pc.is_baked:
-                # Pour rigid body, on utilise bake_all car il n'y a pas
-                # d'opérateur individuel simple
-                bpy.ops.ptcache.bake_all(bake=True)
-                successes += 1
-                log(f"  Rigid Body World → baked")
-        except Exception as e:
-            failures += 1
-            warn(f"  Rigid Body World → échec : {e}")
-
-    for obj in scene.objects:
-        if _interrupted:
-            return successes, failures
-
-        # Particle Systems
-        for i, psys in enumerate(getattr(obj, "particle_systems", [])):
-            if _interrupted:
-                return successes, failures
-            if not psys.point_cache or psys.point_cache.is_baked:
-                continue
-            try:
-                if _ensure_context(scene, obj):
-                    # Sélectionner le bon particle system index
-                    obj.particle_systems.active_index = i
-                    bpy.ops.ptcache.bake({"point_cache": psys.point_cache}, bake=True)
-                    successes += 1
-                    log(f"  Particules '{obj.name}' [{i}] → baked")
-            except Exception as e:
-                failures += 1
-                warn(f"  Particules '{obj.name}' [{i}] → échec : {e}")
-
-        # Modifiers avec point_cache (Cloth, SoftBody, Dynamic Paint)
-        for mod in obj.modifiers:
-            if _interrupted:
-                return successes, failures
-            if mod.type == "FLUID":
-                continue  # Géré séparément
-            pc = getattr(mod, "point_cache", None)
-            if not pc or pc.is_baked:
-                continue
-            try:
-                if _ensure_context(scene, obj):
-                    bpy.ops.ptcache.bake({"point_cache": pc}, bake=True)
-                    successes += 1
-                    log(f"  {mod.type} '{obj.name}.{mod.name}' → baked")
-            except Exception as e:
-                failures += 1
-                warn(f"  {mod.type} '{obj.name}.{mod.name}' → échec : {e}")
-
-            # Dynamic Paint surfaces
-            if mod.type == "DYNAMIC_PAINT":
-                canvas = getattr(mod, "canvas_settings", None)
-                if canvas and hasattr(canvas, "canvas_surfaces"):
-                    for surf in canvas.canvas_surfaces:
-                        if _interrupted:
-                            return successes, failures
-                        spc = getattr(surf, "point_cache", None)
-                        if not spc or spc.is_baked:
-                            continue
-                        try:
-                            if _ensure_context(scene, obj):
-                                bpy.ops.ptcache.bake({"point_cache": spc}, bake=True)
-                                successes += 1
-                                log(f"  DynamicPaint surface '{obj.name}' → baked")
-                        except Exception as e:
-                            failures += 1
-                            warn(f"  DynamicPaint surface '{obj.name}' → échec : {e}")
-
+        failures += 1
     return successes, failures
 
 
@@ -473,10 +398,8 @@ def bake_point_caches_individual(scene: bpy.types.Scene) -> Tuple[int, int]:
 # ═══════════════════════════════════════════
 
 def bake_fluid_domains(scene: bpy.types.Scene) -> Tuple[int, int]:
-    """Bake tous les fluid domains. Retourne (succès, échecs)."""
     successes = 0
     failures = 0
-
     for obj in scene.objects:
         for mod in obj.modifiers:
             if mod.type != "FLUID" or getattr(mod, "fluid_type", None) != "DOMAIN":
@@ -491,8 +414,258 @@ def bake_fluid_domains(scene: bpy.types.Scene) -> Tuple[int, int]:
             except Exception as e:
                 failures += 1
                 warn(f"  Fluid domain '{obj.name}' → échec : {e}")
+    return successes, failures
+
+
+# ═══════════════════════════════════════════
+# Bake — Simulation Nodes (GeoNodes, Blender 4.2)
+# ═══════════════════════════════════════════
+
+def find_simulation_nodes_objects(scene: bpy.types.Scene) -> List[bpy.types.Object]:
+    """
+    Trouve tous les objets avec des modifiers Geometry Nodes
+    contenant des Simulation Zones (nœuds Simulation Input/Output).
+    """
+    result = []
+    for obj in scene.objects:
+        for mod in obj.modifiers:
+            if mod.type != 'NODES' or not mod.node_group:
+                continue
+            # Chercher des nœuds de type Simulation dans le node tree
+            has_sim = False
+            for node in mod.node_group.nodes:
+                # En 4.2, les simulation zones utilisent GeometryNodeSimulationInput/Output
+                if node.type in ('SIMULATION_INPUT', 'SIMULATION_OUTPUT'):
+                    has_sim = True
+                    break
+                # Fallback : chercher par bl_idname
+                if hasattr(node, 'bl_idname'):
+                    if 'Simulation' in node.bl_idname:
+                        has_sim = True
+                        break
+            if has_sim:
+                result.append(obj)
+                break
+    return result
+
+
+def find_geonodes_objects(scene: bpy.types.Scene) -> List[bpy.types.Object]:
+    """Trouve tous les objets avec au moins un modifier Geometry Nodes."""
+    result = []
+    for obj in scene.objects:
+        for mod in obj.modifiers:
+            if mod.type == 'NODES' and mod.node_group:
+                result.append(obj)
+                break
+    return result
+
+
+def configure_geonodes_cache(obj: bpy.types.Object, geonodes_dir: Path) -> int:
+    """
+    Configure le répertoire de cache pour les Simulation Nodes d'un objet.
+    Blender 4.2 : chaque modifier GeoNodes avec simulation a son propre cache.
+    """
+    count = 0
+    for mod in obj.modifiers:
+        if mod.type != 'NODES' or not mod.node_group:
+            continue
+        # En Blender 4.2, le cache des simulation nodes est dans
+        # bpy.types.NodesModifier.simulation_bake_directory
+        if hasattr(mod, 'simulation_bake_directory'):
+            mod.simulation_bake_directory = str(geonodes_dir)
+            count += 1
+        # Alternative : via bake_directory sur le modifier
+        elif hasattr(mod, 'bake_directory'):
+            mod.bake_directory = str(geonodes_dir)
+            count += 1
+    return count
+
+
+def bake_simulation_nodes(scene: bpy.types.Scene, geonodes_dir: Path) -> Tuple[int, int]:
+    """
+    Bake natif des Simulation Nodes (Blender 4.2).
+    Utilise bpy.ops.object.simulation_nodes_cache_bake qui est
+    multi-threadé et exploite tous les CPU disponibles.
+    """
+    if _interrupted:
+        return 0, 0
+
+    successes = 0
+    failures = 0
+
+    # Trouver les objets avec Simulation Nodes
+    sim_objects = find_simulation_nodes_objects(scene)
+    if not sim_objects:
+        log("  Aucun objet avec Simulation Nodes trouvé")
+        return 0, 0
+
+    log(f"  {len(sim_objects)} objet(s) avec Simulation Nodes :")
+    for obj in sim_objects:
+        gn_mods = [m.name for m in obj.modifiers if m.type == 'NODES']
+        log(f"    - {obj.name} ({', '.join(gn_mods)})")
+
+    for obj in sim_objects:
+        if _interrupted:
+            return successes, failures
+
+        log(f"  Bake Simulation Nodes '{obj.name}'...")
+
+        # Configurer le répertoire de cache
+        n_configured = configure_geonodes_cache(obj, geonodes_dir)
+        if n_configured > 0:
+            log(f"    Cache dir → {geonodes_dir}")
+
+        try:
+            if not _ensure_context(scene, obj):
+                failures += 1
+                continue
+
+            # Désélectionner tout, sélectionner uniquement cet objet
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+
+            # Bake natif — multi-threadé dans Blender 4.2
+            # Cette opération utilise le scheduler parallèle de GeoNodes
+            bpy.ops.object.simulation_nodes_cache_bake(selected=True)
+
+            successes += 1
+            log(f"    ✓ '{obj.name}' → baked")
+
+            # Lister les fichiers de cache générés
+            cache_count = 0
+            for f in geonodes_dir.rglob("*"):
+                if f.is_file() and f.suffix.lower() in CACHE_EXTENSIONS:
+                    cache_count += 1
+            if cache_count > 0:
+                log(f"    {cache_count} fichiers de cache générés")
+
+        except Exception as e:
+            failures += 1
+            warn(f"    ✗ '{obj.name}' → échec : {e}")
 
     return successes, failures
+
+
+# ═══════════════════════════════════════════
+# Export Alembic — optionnel, pour transfert vers rendu
+# ═══════════════════════════════════════════
+
+def _safe_alembic_export(filepath: str, start: int, end: int, selected: bool) -> None:
+    """Appelle alembic_export avec paramètres compatibles Blender 4.2."""
+    bpy.ops.wm.alembic_export(
+        filepath=filepath,
+        start=start,
+        end=end,
+        selected=selected,
+        visible_objects_only=False,
+        flatten=False,
+        uvs=True,
+        packuv=True,
+        face_sets=False,
+        subdiv_schema=False,
+        global_scale=1.0,
+        triangulate=False,
+        export_hair=False,
+        export_particles=False,
+        export_custom_properties=True,
+    )
+
+
+def export_alembic_chunked(
+    scene: bpy.types.Scene,
+    objects: List[bpy.types.Object],
+    alembic_dir: Path,
+    frame_start: int,
+    frame_end: int,
+    chunk_size: int,
+) -> Tuple[int, int]:
+    """Exporte chaque objet en chunks Alembic de N frames."""
+    successes = 0
+    failures = 0
+    total_frames = frame_end - frame_start + 1
+
+    for obj in objects:
+        if _interrupted:
+            return successes, failures
+
+        obj_safe_name = obj.name.replace(" ", "_").replace("/", "_")
+        log(f"  Export Alembic '{obj.name}' par chunks de {chunk_size} frames")
+
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+        chunk_start = frame_start
+        chunk_index = 0
+
+        while chunk_start <= frame_end:
+            if _interrupted:
+                return successes, failures
+
+            chunk_end = min(chunk_start + chunk_size - 1, frame_end)
+            abc_name = f"{obj_safe_name}_{chunk_start:04d}-{chunk_end:04d}.abc"
+            abc_path = str(alembic_dir / abc_name)
+
+            log(f"    chunk {chunk_index + 1}: frames {chunk_start}→{chunk_end}")
+            print(f"bake: frame {chunk_start} :: {total_frames}", flush=True)
+
+            try:
+                _safe_alembic_export(
+                    filepath=abc_path,
+                    start=chunk_start,
+                    end=chunk_end,
+                    selected=True,
+                )
+
+                abc_file = Path(abc_path)
+                if abc_file.exists() and abc_file.stat().st_size > 0:
+                    size_mb = abc_file.stat().st_size / (1024 * 1024)
+                    successes += 1
+                    log(f"    ✓ {abc_name} ({size_mb:.1f} MB)")
+                else:
+                    failures += 1
+                    warn(f"    ✗ Fichier non créé : {abc_name}")
+
+            except Exception as e:
+                failures += 1
+                warn(f"    ✗ Échec chunk {chunk_start}-{chunk_end} : {e}")
+
+            chunk_start = chunk_end + 1
+            chunk_index += 1
+
+    return successes, failures
+
+
+def export_alembic_all(
+    scene: bpy.types.Scene,
+    alembic_dir: Path,
+    frame_start: int,
+    frame_end: int,
+    chunk_size: int,
+    specific_objects: Optional[List[str]] = None,
+) -> Tuple[int, int]:
+    """Point d'entrée pour l'export Alembic."""
+    if specific_objects:
+        objects = []
+        for name in specific_objects:
+            obj = scene.objects.get(name.strip())
+            if obj:
+                objects.append(obj)
+            else:
+                warn(f"  Objet '{name}' introuvable dans la scène")
+    else:
+        objects = find_geonodes_objects(scene)
+
+    if not objects:
+        log("  Aucun objet avec Geometry Nodes trouvé pour export Alembic")
+        return 0, 0
+
+    log(f"  {len(objects)} objet(s) à exporter en Alembic")
+    return export_alembic_chunked(
+        scene, objects, alembic_dir,
+        frame_start, frame_end, chunk_size,
+    )
 
 
 # ═══════════════════════════════════════════
@@ -500,7 +673,6 @@ def bake_fluid_domains(scene: bpy.types.Scene) -> Tuple[int, int]:
 # ═══════════════════════════════════════════
 
 def collect_cache_files(cache_root: Path) -> List[Dict[str, Any]]:
-    """Collecte tous les fichiers de cache avec métadonnées."""
     files = []
     for f in sorted(cache_root.rglob("*")):
         if not f.is_file():
@@ -514,9 +686,7 @@ def collect_cache_files(cache_root: Path) -> List[Dict[str, Any]]:
             files.append({
                 "path": str(f.relative_to(cache_root)),
                 "size": stat.st_size,
-                "timestamp": datetime.datetime.fromtimestamp(
-                    stat.st_mtime
-                ).isoformat(),
+                "timestamp": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
             })
         except OSError:
             pass
@@ -533,11 +703,8 @@ def write_manifest(
     duration: float,
     bake_stats: Dict[str, int],
 ) -> None:
-    """Écrit le cache_manifest.json."""
     cache_files = collect_cache_files(cache_root)
-
     total_size = sum(f["size"] for f in cache_files)
-
     manifest = {
         "blender_version": bpy.app.version_string,
         "scene": scene_name,
@@ -552,7 +719,6 @@ def write_manifest(
         "file_count": len(cache_files),
         "files": cache_files,
     }
-
     manifest_path = cache_root / "cache_manifest.json"
     try:
         manifest_path.write_text(
@@ -571,7 +737,6 @@ def write_manifest(
 def main() -> int:
     install_signal_handlers()
     args = parse_args()
-
     start_time = time.time()
 
     cache_root = Path(args.cache_dir).expanduser().resolve()
@@ -580,32 +745,32 @@ def main() -> int:
     cpu_count = os.cpu_count() or 1
     n_threads = args.bake_threads if args.bake_threads else max(1, cpu_count - RESERVE_THREADS)
 
-    # ── Bannière de démarrage ──
     log("=" * 70)
-    log("Démarrage bake_all.py")
-    log(f"  Fichier .blend: {bpy.data.filepath}")
-    log(f"  Cache dir     : {cache_root}")
-    log(f"  CPU           : {cpu_count} threads")
-    log(f"  Bake threads  : {n_threads}")
-    log(f"  Frame start   : {args.frame_start}")
-    log(f"  Frame end     : {args.frame_end}")
+    log("Démarrage bake_all.py (Blender 4.2 LTS)")
+    log(f"  Fichier .blend  : {bpy.data.filepath}")
+    log(f"  Cache dir       : {cache_root}")
+    log(f"  CPU             : {cpu_count} threads")
+    log(f"  Bake threads    : {n_threads}")
+    log(f"  Frame start     : {args.frame_start}")
+    log(f"  Frame end       : {args.frame_end}")
+    log(f"  Bake GeoNodes   : {args.bake_geonodes}")
+    log(f"  Export Alembic  : {args.export_alembic}")
     log("=" * 70)
 
     if not verify_blend_loaded():
         return 1
 
-    # ── Créer les sous-répertoires de cache ──
+    if not verify_blender_version():
+        return 1
+
     cache_dirs = setup_cache_directories(cache_root)
     setup_ptcache_symlink(cache_root)
 
-    # ── Scènes à traiter ──
     scenes = list(bpy.data.scenes) if args.all_scenes else [bpy.context.scene]
 
-    # ── Statistiques globales ──
     all_errors: List[str] = []
     total_successes = 0
     total_failures = 0
-    final_status = "complete"
     last_scene_name = ""
     frame_start = 1
     frame_end = 250
@@ -618,10 +783,8 @@ def main() -> int:
         log(f"─── Scène : {scene.name} ───")
 
         try:
-            # Threading
             configure_threading(scene, n_threads)
 
-            # Frame range
             if args.frame_start is not None:
                 scene.frame_start = args.frame_start
             if args.frame_end is not None:
@@ -630,29 +793,26 @@ def main() -> int:
             frame_end = scene.frame_end
             log(f"  Frame range : {frame_start} → {frame_end}")
 
-            # Configurer les caches disque
-            configure_disk_caches(scene, cache_dirs["ptcache"])
+            configure_disk_caches(scene)
 
-            # Configurer les fluid domains
             if args.bake_fluids:
                 n_fluids = configure_fluid_domains(scene, cache_dirs["fluids"])
                 log(f"  {n_fluids} fluid domain(s) configuré(s)")
 
-            # Clear si demandé
             if args.clear_existing:
                 warn("clear-existing activé : suppression des caches existants")
                 clear_all_caches(scene)
 
-            # ── Bake Point Caches ──
+            # ── 1. Bake Point Caches (particules, cloth, rigid body) ──
             if args.bake_cloth or args.bake_particles:
                 log(f"[{scene.name}] Bake point caches…")
-                pc_ok, pc_fail = bake_point_caches_individual(scene)
+                pc_ok, pc_fail = bake_point_caches(scene)
                 total_successes += pc_ok
                 total_failures += pc_fail
                 if pc_fail > 0:
                     all_errors.append(f"[{scene.name}] {pc_fail} point cache(s) échoué(s)")
 
-            # ── Bake Fluids ──
+            # ── 2. Bake Fluids (Mantaflow) ──
             if args.bake_fluids and not _interrupted:
                 log(f"[{scene.name}] Bake fluid domains…")
                 fl_ok, fl_fail = bake_fluid_domains(scene)
@@ -661,13 +821,41 @@ def main() -> int:
                 if fl_fail > 0:
                     all_errors.append(f"[{scene.name}] {fl_fail} fluid domain(s) échoué(s)")
 
+            # ── 3. Bake Simulation Nodes (GeoNodes natif, multi-threadé) ──
+            if args.bake_geonodes and not _interrupted:
+                log(f"[{scene.name}] Bake Simulation Nodes (GeoNodes)…")
+                gn_ok, gn_fail = bake_simulation_nodes(scene, cache_dirs["geonodes"])
+                total_successes += gn_ok
+                total_failures += gn_fail
+                if gn_fail > 0:
+                    all_errors.append(f"[{scene.name}] {gn_fail} bake(s) GeoNodes échoué(s)")
+
+            # ── 4. Export Alembic (optionnel, pour transfert vers rendu) ──
+            if args.export_alembic and not _interrupted:
+                log(f"[{scene.name}] Export Alembic…")
+                specific = None
+                if args.alembic_objects:
+                    specific = [s.strip() for s in args.alembic_objects.split(",")]
+                abc_ok, abc_fail = export_alembic_all(
+                    scene=scene,
+                    alembic_dir=cache_dirs["alembic"],
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    chunk_size=args.alembic_chunk,
+                    specific_objects=specific,
+                )
+                total_successes += abc_ok
+                total_failures += abc_fail
+                if abc_fail > 0:
+                    all_errors.append(f"[{scene.name}] {abc_fail} export(s) Alembic échoué(s)")
+
         except Exception as e:
             error_msg = f"[{scene.name}] Erreur inattendue : {e}"
             err(error_msg)
             all_errors.append(error_msg)
             total_failures += 1
 
-    # ── Déterminer le statut final ──
+    # ── Statut final ──
     duration = time.time() - start_time
 
     if _interrupted:
@@ -679,7 +867,6 @@ def main() -> int:
     else:
         final_status = "complete"
 
-    # ── Écrire le manifest ──
     bake_stats = {
         "successes": total_successes,
         "failures": total_failures,
@@ -697,7 +884,6 @@ def main() -> int:
         bake_stats=bake_stats,
     )
 
-    # ── Résumé final ──
     cache_files = collect_cache_files(cache_root)
     total_size = sum(f["size"] for f in cache_files)
 
@@ -709,12 +895,11 @@ def main() -> int:
     log(f"  Fichiers cache : {len(cache_files)}")
     log(f"  Taille totale  : {total_size} octets")
     if all_errors:
-        log(f"  Erreurs :")
+        log("  Erreurs :")
         for e in all_errors:
             log(f"    - {e}")
     log("=" * 70)
 
-    # ── Code de sortie ──
     if _interrupted:
         return 1
     if total_failures > 0 and total_successes == 0:

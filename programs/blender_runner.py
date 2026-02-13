@@ -1,5 +1,5 @@
 """
-Gestionnaire du processus Blender
+Gestionnaire du processus Blender 4.2 LTS
 """
 
 import asyncio
@@ -34,7 +34,6 @@ class BlenderRunner:
 
         logger.info(f"Lancement de Blender: {self.blend_file}")
 
-        # Commande Blender
         cmd = [
             Config.BLENDER_EXECUTABLE,
             '--background',
@@ -46,11 +45,11 @@ class BlenderRunner:
 
         logger.info(f"Commande: {' '.join(cmd)}")
 
-        # Environnement avec OMP_NUM_THREADS pour Mantaflow multi-thread
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = str(Config.BAKE_THREADS)
-        # Pas de binding CPU pour laisser le scheduler optimiser
         env.pop("OMP_PROC_BIND", None)
+        # Variable lue par bake_all.py pour le chunking Alembic
+        env["ALEMBIC_CHUNK_FRAMES"] = str(Config.ALEMBIC_CHUNK_FRAMES)
         logger.info(f"OMP_NUM_THREADS={Config.BAKE_THREADS}")
 
         try:

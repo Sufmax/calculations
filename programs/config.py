@@ -57,14 +57,11 @@ class Config:
     ZSTD_DICT_SIZE = _get_int_env('ZSTD_DICT_SIZE', 256 * 1024)
     ZSTD_MIN_TRAINING_SAMPLES = _get_int_env('ZSTD_MIN_TRAINING_SAMPLES', 10)
 
-    S3_MULTIPART_THRESHOLD = _get_int_env(
-        'S3_MULTIPART_THRESHOLD',
-        5 * 1024 * 1024
-    )
-    S3_MULTIPART_CHUNK_SIZE = _get_int_env(
-        'S3_MULTIPART_CHUNK_SIZE',
-        5 * 1024 * 1024
-    )
+    # Upload (StorjUploader via urllib3)
+    UPLOAD_MAX_RETRIES = _get_int_env('UPLOAD_MAX_RETRIES', 3)
+
+    # Export Alembic (Geometry Nodes) — frames par chunk
+    ALEMBIC_CHUNK_FRAMES = _get_int_env('ALEMBIC_CHUNK_FRAMES', 10)
 
     PROGRESS_REPORT_INTERVAL = _get_float_env(
         'PROGRESS_REPORT_INTERVAL',
